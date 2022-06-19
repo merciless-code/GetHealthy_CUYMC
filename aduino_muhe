@@ -1,0 +1,815 @@
+
+/* —————————————— 常变量函数定义区域 —————————————— */
+
+/* 连接LOT的AT指令,可修改WIFI和三元组 */
+//#define AT_1 "AT+RST"    //AT重启指令暂时不用
+//#define AT_2 "AT+RESTORE"
+#define AT_3 "AT+CWMODE=1"
+#define AT_4 "AT+CIPSNTPCFG=1,8,\"ntp1.aliyun.com\""
+#define AT_5 "AT+CWJAP=\"ssid\",\"password\""    //可以修改WIFI密码
+#define AT_6 "AT+MQTTUSERCFG=0,1,\"NULL\",\"D001&a1Vb2Dl0KO3\",\"1e6ab272b10b1fc542fc9e8387c952a11300b5401f2011c417f0e16b54edcc5e\",0,0,\"\""   //可以修改三元组
+#define AT_7 "AT+MQTTCLIENTID=0,\"a1Vb2Dl0KO3.D001|securemode=2\\,signmethod=hmacsha256\\,timestamp=1647509050204|\""
+#define AT_8 "AT+MQTTCONN=0,\"a1Vb2Dl0KO3.iot-as-mqtt.cn-shanghai.aliyuncs.com\",1883,1"
+
+/* 连接天气网站的AT指令,可修改密钥和城市地址 */
+#define AT_10 "AT+CIPSTART=\"TCP\",\"api.seniverse.com\",80"         //连接天气服务器
+#define AT_11 "AT+CIPMODE=1"            //开启透传模式
+#define AT_12 "AT+CIPSEND"              //开启透传
+#define AT_13 "AT+CIPMODE=0"            //关闭透传模式
+#define AT_14 "AT+CIPCLOSE"             //断开服务器
+#define Api_Weather "GET https://api.seniverse.com/v3/weather/now.json?key=S5BXSOzY_-tV09NZU&location=hangzhou&language=zh-Hans&unit=c"   //获取天气信息
+#define Api_OFF "+++"                   //关闭透传
+
+/* LOT上设备通信所用的Topic */
+#define Topic_Set "\"/sys/a1Vb2Dl0KO3/D001/thing/service/property/set\""
+#define Topic_Plan "\"/a1Vb2Dl0KO3/D001/user/AcceptPlan\""
+#define Topic_Record "\"/a1Vb2Dl0KO3/D001/user/SendRecord\""
+
+/* 请求读取当前时间，利用NTP时间戳 */
+#define AT_NTPTime "AT+MQTTPUB=0,\"/ext/ntp/a1Vb2Dl0KO3/D001/request\",\"{\\\"deviceSendTime\\\":\\\"1571724098000\\\"}\",0,0"   //发送的时间无意义，只是为了获取准确时间
+
+/* 定义数组数据大小 */
+#define SIZE_PLANARRAY 16     //设置用药计划结构体数组大小
+
+/* 定义早中晚饭时间以用于提醒 */
+#define NTPtime_Breakfast 8
+#define NTPtime_Lunchtime 12
+#define NTPtime_Dinner 18
+#define NTPtime_Test 18      //自定义时间提醒
+//18为北京时间下午6点0分
+//自定义半小时前提醒及5点30分提醒
+
+/* 定义LED灯的数量 */
+#define LED_Number 10  //不超过10个灯
+
+/* 定义键盘模组按钮数 */
+#define KEY_ROWS 4 //按钮模组列数
+#define KEY_COLS 4 //按钮模组行数
+
+/* 定义键盘模组按钮引脚及指代内容 */
+char keymap[KEY_ROWS][KEY_COLS] = {  //依照行、列排列的按钮内容
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte colPins[KEY_COLS] = {31, 30, 29, 28};       //按钮行引脚
+byte rowPins[KEY_ROWS] = {35, 34, 33, 32};       //按钮列引脚 
+
+/* 导入库、定义常变量 */
+#include <ArduinoJson.h>    //JOSN字符串库
+#include <SoftwareSerial.h>
+#include <Keypad.h>      //Keypad库控制薄膜键盘
+#include <U8g2lib.h>     //图像处理库控制LCD12864,已经设置好自定义新字库 u8g2_font_unifont_t_chinese1
+#ifdef U8X8_HAVE_HW_SPI  //
+#include <SPI.h>         //SPI库及定义（也不知道是干什么的=。=）！！！！！！
+#endif                   //
+SoftwareSerial softSerial1(10,11); //定义软串口1与音乐播放器模块通信
+
+//定义屏幕实例及其引脚、2—E、3—R\W、4—RS、串连5V电源—VO（控制对比度）、GND—(PSB、GND、BLK）、VCC—(VCC、BLA)
+U8G2_ST7920_128X64_2_SW_SPI u8g2(U8G2_R0, /* clock=*/ 2 /* A4 */ , /* data=*/ 3 /* A2 */, /* CS=*/ 4 /* A3 */, /* reset=*/ U8X8_PIN_NONE);
+//新字库内容 "一条新的用药计划" "一条新的远程命令" "处理中" "要注意身体健康" "多运动多锻炼" "不适合外出" "注意防暑"
+//"遏制全球变暖，从你我做起" "注意保暖" "关注天气变化" "按" "停止提醒" "正在设定药品位置" "展示药品计划" "整活了"
+
+//初始化定义薄膜键盘、makeKeymap(按钮模组字符定义)、按钮列引脚、按钮行引脚、列数、行数
+Keypad myKeypad = Keypad(makeKeymap(keymap), rowPins, colPins, KEY_ROWS, KEY_COLS);
+
+
+/* —————— 函数声明区域 —————— */
+
+void InitLED();            //LED灯pin脚定义初始化
+void Serial_Transfer();    //AT指令结果反馈函数
+int Aliyun_Connect();      //LOT连接函数，返回为是否连接
+void LOT_NTPTimeGet(long unsigned int* NTPTime);   //初始化时间戳函数
+void LCD_Aliyun(const int i);   //显示屏显示物联网状态，根据指示代码
+void ReqWeather(int* Phenomena,int* Temperature);   //ESP串口连接天气服务器获取天气信息
+void GETWeather(String Json,int* Phenomena,int* Temperature);  //依据Json字符串提取天气信息
+String CodeWeather(int Phenomena);    //根据天气代码显示天气字符串
+void LCD_Normal();   //显示屏显示天气及时间信息，正常工作状态
+int Json_isTopic(String espjson);    //依据主题，分析处理ESP串口数据函数
+void Char_ASRCommand(char* asrchar);  //从ASR语音识别串口获取命令,并根据命令控制运行
+void Char_KEYCommand(char* asrchar);  //从键盘上获取字符命令,并根据命令控制运行
+void Key_LEDPinPlan();  //键盘模块控制用药计划格子
+String Json_Extraction(String Json_Str);    //从串口数据提取Json字符串函数
+int Json_Parse(String Json,bool* ONReview_Plan,bool* RemindTime_DIY,int* Music_Number,int* OFFLED_PIN,int* ONLED_PIN,int* LightSwitch);
+//依据Json字符串提取控制指令函数
+void INT_LEDCommand(int* ONLED_PIN,int* OFFLED_PIN,int* LightSwitch);   //控制LED灯组工作
+int InitPlan(String PlanJson);    //依据Json字符串提取用药计划函数
+int DecidePlan();    //更新用药计划状态函数
+void PrintPlan(const int pstate);    //输出全部符合pstate状态的用药计划到串口函数（输入1则全部输出）
+int Voice(int* Voice_Number);    //依靠输入数字控制播放音乐模块函数
+void NTPRemind();   //计算现实时间，看是否开始提醒作业
+
+
+/* —————————————— 全局变量定义区域 —————————————— */
+
+/* —————— 结构体数组定义存储数据 —————— */
+
+/* 存储用药计划的结构体及数组定义 */
+typedef struct Plan{   //用药计划链表节点定义 储存数据格式
+  char DoctorName[20]; 
+  char MedName[30]; 
+  char Remark[50]; 
+  int OnceMeasure;
+  int IntervalHour; 
+  boolean IF_BeforeEat;
+  long unsigned int StartTimeNTP; 
+  long unsigned int EndTimeNTP;
+  int ledpin;      //药品存放的格子,自定义
+  int state = 0;   //单个计划的工作状态
+}Plan;
+
+Plan PlanArray[SIZE_PLANARRAY];  //创建计划数组
+
+int LED[LED_Number];  //定义灯的引脚
+
+//来自物联网端的命令信息
+bool ONReview_Plan = false;
+bool RemindTime_DIY = false;
+int Music_Number = 0;
+int OFFLED_PIN = 0;
+int ONLED_PIN = 0;
+int LightSwitch = 0;
+
+//来自天气网站的天气信息
+int Phenomena = 0;     //天气状况指示码
+int Temperature = 0;     //温度
+
+long unsigned int MCU_BootingTime = 1571724098;  //long型正好足够记录单位s的时间戳，而Arduino没有long long型变量
+String espstring;       //用来存放处理esp8266的串口数据
+char asrchar = ' ';         //用来存放处理语音识别模块的串口数据
+int NTPtime = 0;     //记录是否饭前和防止重复提醒
+int SoundSwitch = 0;   //控制音乐流转
+int DLCSwitch = 0;     //控制彩蛋流转
+int LEDSwitch = 1;     //控制物联网全部灯流转
+int AwakeSwitch = 0;   //控制唤醒词反馈语音流转
+int LEDKEYSwitch = 1;  //使用键盘控制LED灯的开关
+
+
+/* —————————————— SETUP函数区域 —————————————— */
+
+void setup()
+{
+  Serial.begin(9600);             //与电脑连接的硬串口一般不建议连接其他设备
+  Serial3.begin(9600);            //定义为Serial3串口专门与esp8266连接 "AT+UART_DEF=9600,8,1,0,0"已经把esp8266波特率改成9600
+  Serial2.begin(9600);            //语音识别模块连接,使用'A''B''C''D''E'控制通信
+  softSerial1.begin(9600);        //音乐播放器软串口,波特率为9600,引脚为10和11
+  u8g2.begin();                   //显示屏初始化
+  u8g2.enableUTF8Print();         //使显示屏的print函数支持UTF8字集
+  u8g2.setFontDirection(0);       //设置显示屏旋转度数
+  if(!Aliyun_Connect()){          //阿里云连接函数 
+    LOT_NTPTimeGet(&MCU_BootingTime);       //读取设备开机时准确的北京时间 给MCU_BootingTime记录
+  }
+  InitLED();      //灯引脚初始化
+  ReqWeather(&Phenomena,&Temperature);    //更新天气信息
+}
+
+/* —————————————— loop函数区域 —————————————— */
+
+void loop()
+{
+  if(Serial3.available()){                             //和esp通信、注意串口容易丢失数据，要保证loop函数准确
+    espstring = Serial3.readString();                  //使用.readString()可以直接读取全部串口内容，可以不需要循环了(但是实际上有点不稳定，需要一个循环)
+    Serial.println(espstring);
+    Json_isTopic(espstring);                           //根据主题及内容指令控制运行  
+  }
+  if(Serial2.available()){                             //和语音识别模块通信
+    asrchar = Serial2.read();
+    Serial.println(asrchar);
+    Char_ASRCommand(&asrchar);                         //根据通信指令控制运行                 
+  }
+  NTPRemind(); MuheDLC(); LCD_Normal();                //NTPRemind()会在没有计划时候到点提醒！！！！！！！  //彩蛋函数  //显示平常状态下的显示屏
+  //通过Keypad库的getKey()方法获取按键的字元
+  char key = myKeypad.getKey();
+  char key1 = ' ';    //替换用,无意义
+  if(key){    //当按下按键
+    key1 = key;
+    Serial.println(key);                    //硬串口电脑显示按键的字元
+    Char_KEYCommand(&key1);                 //根据通信指令控制运行 
+  }
+}
+
+
+
+
+/* —————————————— 函数定义区域 —————————————— */
+/* 键盘模块控制用药计划格子 */
+void Key_LEDPinPlan(){
+  LightSwitch = -1;INT_LEDCommand(&ONLED_PIN,&OFFLED_PIN,&LightSwitch); //关闭所有LED提醒
+  char key1 = ' ';    //替换用,无意义
+  int i = 0;
+  while(i < SIZE_PLANARRAY){
+    if(PlanArray[i].state == 0) {i++; continue;}
+    digitalWrite(PlanArray[i].ledpin,HIGH);
+    while(1){
+      char key = myKeypad.getKey();
+      if(key){    //当按下按键
+        key1 = key;
+        Serial.println(key1);                    //硬串口电脑显示按键的字元
+        if(key1 == '0') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=0; break;}
+        else if(key1 == '1') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=1; break;}
+        else if(key1 == '2') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=2; break;}
+        else if(key1 == '3') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=3; break;}
+        else if(key1 == '4') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=4; break;}
+        else if(key1 == '5') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=5; break;}
+        else if(key1 == '6') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=6; break;}
+        else if(key1 == '7') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=7; break;}
+        else if(key1 == '8') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=8; break;}
+        else if(key1 == '9') {digitalWrite(LED[PlanArray[i].ledpin],LOW); PlanArray[i].ledpin=9; break;}
+        else if(key1 == '#') {digitalWrite(LED[PlanArray[i].ledpin],LOW); break;}
+        else if(key1 == '*') {return 0;}
+      }
+    }
+    i++;
+  }
+  return 0;
+}
+
+/* 键盘模块控制药盒 */
+void Char_KEYCommand(char* asrchar){
+  if(*asrchar == 'A'){   //停止提醒
+    Music_Number = 0;Voice(&Music_Number);
+    LightSwitch = -1;INT_LEDCommand(&ONLED_PIN,&OFFLED_PIN,&LightSwitch); //关闭所有LED提醒
+    Music_Number = 14;Voice(&Music_Number);
+    Serial.println("已停止提醒！");
+  }else if(*asrchar == 'B'){   //开始播放和下一首音乐
+    Music_Number = 29 + SoundSwitch;Voice(&Music_Number);SoundSwitch = (SoundSwitch+1)%4;
+    Music_Number = 15;Voice(&Music_Number);
+    Serial.println("已经开始音乐播放，请欣赏！"); 
+  }else if(*asrchar == 'C'){   //展示所有用药计划!!!!!
+    Music_Number = 13;Voice(&Music_Number);
+    PrintPlan(1);
+  }else if(*asrchar == 'D'){   //启动自定义提醒
+    Music_Number = 7;Voice(&Music_Number);
+    PrintPlan(1);
+  }else if(*asrchar == '*'){   //设置LED灯键盘开关模式
+    LEDKEYSwitch = (LEDKEYSwitch + 1)%2;
+    if(LEDKEYSwitch == 0) Serial.println("设置LED灯键盘关闭模式！");
+    else if(LEDKEYSwitch == 1) Serial.println("设置LED灯键盘开启模式！");
+  }else if(*asrchar == '#'){   //设置药品存放位置模式
+    Serial.println("开始设置药品存放位置！");
+    Key_LEDPinPlan();
+    Serial.println("设置药品存放位置完成！");
+  }else if(*asrchar >= '0' and *asrchar <= '9'){   //控制LED灯组
+    if(*asrchar == '0') digitalWrite(LED[0],LEDKEYSwitch);
+    else if(*asrchar == '1') digitalWrite(LED[1],LEDKEYSwitch);
+    else if(*asrchar == '2') digitalWrite(LED[2],LEDKEYSwitch);
+    else if(*asrchar == '3') digitalWrite(LED[3],LEDKEYSwitch);
+    else if(*asrchar == '4') digitalWrite(LED[4],LEDKEYSwitch);
+    else if(*asrchar == '5') digitalWrite(LED[5],LEDKEYSwitch);
+    else if(*asrchar == '6') digitalWrite(LED[6],LEDKEYSwitch);
+    else if(*asrchar == '7') digitalWrite(LED[7],LEDKEYSwitch);
+    else if(*asrchar == '8') digitalWrite(LED[8],LEDKEYSwitch);
+    else if(*asrchar == '9') digitalWrite(LED[9],LEDKEYSwitch);
+    Serial.println("控制LED灯组！");
+  }
+  *asrchar = ' ';
+  return 0;
+}
+
+/* 显示屏显示平常信息 */
+void LCD_Normal(){
+  long unsigned int NTPtime_new = MCU_BootingTime + int(millis()/1000);
+  unsigned int NTPDAY_new = NTPtime_new % 86400;
+  unsigned int NTPHour_new = (int(NTPDAY_new / 3600) + 8)%24;
+  unsigned int NTPMinute_new = int((NTPDAY_new % 3600)/60);
+  unsigned int NTPSecond_new = NTPDAY_new % 60;
+  u8g2.firstPage();
+  do{
+    u8g2.setFont(u8g2_font_unifont_t_chinese1);     //设置显示屏字体
+    u8g2.setCursor(0, 15);
+    u8g2.print(String(NTPHour_new)+':'+String(NTPMinute_new)+':'+String(NTPSecond_new));
+    u8g2.setCursor(75, 15);
+    u8g2.print(Temperature); 
+    u8g2.setCursor(100, 15);
+    u8g2.print(CodeWeather(Phenomena));  
+    u8g2.setCursor(0, 50);
+    u8g2.print("要注意身体健康");     
+  }while(u8g2.nextPage());
+  return 0;
+}
+
+/* 根据天气代码显示天气字符，来源心知天气 */
+String CodeWeather(int Phenomena){
+  if(Phenomena == 0 or Phenomena == 1 or Phenomena == 2 or Phenomena == 3){return "晴";}
+  else if(Phenomena == 4){return "多云";}
+  else if(Phenomena == 5 or Phenomena == 6){return "晴间多云";}
+  else if(Phenomena == 7 or Phenomena == 8){return "大部多云";}
+  else if(Phenomena == 9){return "阴";}
+  else if(Phenomena == 10){return "阵雨";}
+  else if(Phenomena == 11){return "雷阵雨";}
+  else if(Phenomena == 12){return "雷阵雨伴有冰雹";}
+  else if(Phenomena == 13){return "小雨";}
+  else if(Phenomena == 14){return "中雨";}
+  else if(Phenomena == 15){return "大雨";}
+  else if(Phenomena == 16){return "暴雨";}
+  else if(Phenomena == 17){return "大暴雨";}
+  else if(Phenomena == 18){return "特大暴雨";}
+  else if(Phenomena == 19){return "冻雨";}
+  else if(Phenomena == 20){return "雨夹雪";}
+  else if(Phenomena == 21){return "阵雪";}
+  else if(Phenomena == 22){return "小雪";}
+  else if(Phenomena == 23){return "中雪";}
+  else if(Phenomena == 24){return "大雪";}
+  else if(Phenomena == 25){return "暴雪";}
+  else if(Phenomena == 26){return "浮尘";}
+  else if(Phenomena == 27){return "扬沙";}
+  else if(Phenomena == 28){return "沙尘暴";}
+  else if(Phenomena == 29){return "强沙尘暴";}
+  else if(Phenomena == 30){return "雾";}
+  else if(Phenomena == 31){return "霾";}
+  else if(Phenomena == 32){return "风";}
+  else if(Phenomena == 33){return "大风";}
+  else if(Phenomena == 34){return "飓风";}
+  else if(Phenomena == 35){return "热带风暴";}
+  else if(Phenomena == 36){return "龙卷风";}
+  else if(Phenomena == 37){return "冷";}
+  else if(Phenomena == 38){return "热";}
+  return "未知";
+}
+
+/* 彩蛋函数，随便更新时间及天气情况 */
+void MuheDLC(){  //设定每小时30分钟的时候播放彩蛋,随便检查时间NTP和药品过期情况
+  long unsigned int NTPtime_new = MCU_BootingTime + int(millis()/1000);
+  unsigned int NTPhour_new = NTPtime_new % 3600;
+  if(NTPhour_new <= 1800+2 and NTPhour_new >= 1800-2){
+    Serial.println("这是小彩蛋哦~~~");
+    if(DLCSwitch == 4) DLCSwitch = 0;   //使用DLCSwitch轮回播放彩蛋
+    Music_Number = 26 + DLCSwitch;Voice(&Music_Number); //注意Voice(&Music_Number)没法直接输入数字，毕竟输入的是指针
+    DLCSwitch += 1;
+    LOT_NTPTimeGet(&MCU_BootingTime);       //读取设备开机时准确的北京时间 给MCU_BootingTime记录
+    DecidePlan();     //检查药品计划过期情况
+    ReqWeather(&Phenomena,&Temperature);    //更新天气信息
+  }
+  return 0;
+}
+
+/* 接受有JSON的字符串，并根据Topic类型保存计划或者控制模块运作 */
+int Json_isTopic(String espjson){  //espjson为带主题的esp串口字符串信息
+  if(espjson.indexOf(Topic_Set) > 0){  //物模型主题
+    espjson = Json_Extraction(espjson); Serial.println(espjson);
+    if(espjson == "ERRER")  return -1;
+    Json_Parse(espjson,&ONReview_Plan,&RemindTime_DIY,&Music_Number,&OFFLED_PIN,&ONLED_PIN,&LightSwitch);
+    Serial.println(Music_Number);
+    Voice(&Music_Number);    //控制音乐播放器，临时用Music_Number控制，-1播放 0暂停
+    Serial.println(Music_Number);
+    INT_LEDCommand(&ONLED_PIN,&OFFLED_PIN,&LightSwitch);  //控制LED灯组
+    if(ONReview_Plan == 1){PrintPlan(1);ONReview_Plan = 0;}  //展示所有用药计划
+    if(RemindTime_DIY == 1){Music_Number = 7;Voice(&Music_Number);PrintPlan(1);RemindTime_DIY = 0;}  //开启自定义提醒
+  }else if(espjson.indexOf(Topic_Plan) > 0){  //用药计划主题
+    espjson = Json_Extraction(espjson); Serial.println(espjson);
+    if(espjson == "ERRER"){return -1;}
+    InitPlan(espjson);PrintPlan(1);  //保存用药计划到数组里
+    Music_Number = 8;Voice(&Music_Number);
+  }
+  return 0;
+}
+
+/* 语音识别模块控制药盒 */
+void Char_ASRCommand(char* asrchar){
+  if(*asrchar == 'A'){   //唤醒词
+    Music_Number = 9 + AwakeSwitch;Voice(&Music_Number);AwakeSwitch = (AwakeSwitch+1)%4;
+    Serial.println("小药听到了！");
+  }else if(*asrchar == 'B'){   //展示所有用药计划!!!!!
+    Music_Number = 13;Voice(&Music_Number);
+    PrintPlan(1);
+  }else if(*asrchar == 'C'){   //停止提醒
+    Music_Number = 0;Voice(&Music_Number);
+    LightSwitch = -1;INT_LEDCommand(&ONLED_PIN,&OFFLED_PIN,&LightSwitch); //关闭所有LED提醒
+    Music_Number = 14;Voice(&Music_Number);
+    Serial.println("已停止提醒！");
+  }else if(*asrchar == 'D'){   //开始播放和下一首音乐
+    Music_Number = 29 + SoundSwitch;Voice(&Music_Number);SoundSwitch = (SoundSwitch+1)%4;
+    Music_Number = 15;Voice(&Music_Number);
+    Serial.println("已经开始音乐播放，请欣赏！");  
+  }else if(*asrchar == 'E'){   //暂停音乐!!!!!
+    Music_Number = 0;Voice(&Music_Number);
+    Music_Number = 16;Voice(&Music_Number);
+    Serial.println("已暂停播放音乐！");
+  }else if(*asrchar == 'F'){   //继续播放音乐
+    Music_Number = -1;Voice(&Music_Number);
+    Music_Number = 17;Voice(&Music_Number);
+    Serial.println("已继续播放音乐！");
+  }else if(*asrchar == 'G'){   //今天天气真好
+    Music_Number = 18;Voice(&Music_Number);
+    Serial.println("今天天气真好！");
+  }else if(*asrchar == 'H'){   //好不想吃药
+    Music_Number = 19;Voice(&Music_Number);
+    Serial.println("好不想吃药！");
+  }else if(*asrchar == 'I'){   //今天如何
+    if(Temperature > 35){     //炎热
+      Music_Number = 23;Voice(&Music_Number);
+      Serial.println("炎热不适合外出！"); return 0;
+    }
+    if(Phenomena <= 3){       //晴
+      Music_Number = 20;Voice(&Music_Number);
+    }else if(Phenomena <= 9){        //多云
+      Music_Number = 22;Voice(&Music_Number);
+    }else if(Phenomena <= 20){       //雨
+      Music_Number = 21;Voice(&Music_Number);
+    }else{                           //极端天气
+      Music_Number = 24;Voice(&Music_Number);
+    }
+    Serial.println("今天如何?");
+  }
+  *asrchar = ' ';
+  return 0;
+}
+
+/* 物模型JSON提取所需变量函数 */
+// ONReview_Plan展示计划、RemindTime_DIY开启提醒、Music_Number语音控制、其他控制LED灯组
+int Json_Parse(String Json,bool* ONReview_Plan,bool* RemindTime_DIY,int* Music_Number,int* OFFLED_PIN,int* ONLED_PIN,int* LightSwitch){
+  StaticJsonDocument<600> jsonBuffer;       //创建一个名为jsonBuffer的JSON变量
+  DeserializationError error = deserializeJson(jsonBuffer, Json);  //使用Json字符串构建JSON变量并赋值于jsonBuffer
+  if (error){     //构建错误就报错  
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return -1;
+  }
+  *ONReview_Plan = jsonBuffer["params"]["ONReview_Plan"];
+  *RemindTime_DIY = jsonBuffer["params"]["RemindTime_DIY"];
+  *Music_Number = jsonBuffer["params"]["Music_Number"];
+  *OFFLED_PIN = jsonBuffer["params"]["OFFLED_PIN"];
+  *ONLED_PIN = jsonBuffer["params"]["ONLED_PIN"];
+  *LightSwitch = jsonBuffer["params"]["LightSwitch"];
+  Serial.print(*ONReview_Plan);Serial.print(" ; ");
+  Serial.print(*RemindTime_DIY);Serial.print(" ; ");
+  Serial.print(*Music_Number);Serial.print(" ; ");
+  Serial.print(*OFFLED_PIN);Serial.print(" ; ");
+  Serial.print(*ONLED_PIN);Serial.print(" ; ");
+  Serial.println(*LightSwitch);
+  return 0;
+}
+
+/* 计划数组写入数据 */
+int InitPlan(String PlanJson){
+  StaticJsonDocument<200> jsonBuffer;        //创建一个名为jsonBuffer的JSON变量
+  DeserializationError error = deserializeJson(jsonBuffer, PlanJson);   //使用Json字符串构建JSON变量并赋值于jsonBuffer
+  if (error){      //构建错误就报错（使用Serial来测试）  
+    Serial.print(F("deserializeJson() failed: ")); 
+    Serial.println(error.f_str());
+    return -1;
+  }   //将带用药计划的JSON字符串转化为JSON并保存所需变量到结构体
+  int i = 0; int j = 0;   //i历遍结构体数组 j历遍单个结构体下某个字符数组
+  while(i < SIZE_PLANARRAY and PlanArray[i].state != 0) i++;  //寻找状态为0及无效的结构体
+  if(i == SIZE_PLANARRAY){ Serial.println("Error for adding plan!"); return -2;}
+  const char* gostring = NULL;   //设置常字符指针存放JSON里的字符串并转发给结构体
+  gostring = jsonBuffer["DoctorName"];
+  while(gostring[j]!='\0' and j < 30){
+    PlanArray[i].DoctorName[j] = gostring[j]; j++;
+  } PlanArray[i].DoctorName[j] = '\0'; j = 0;
+  gostring = jsonBuffer["MedName"];
+  while(gostring[j]!='\0' and j < 30){
+    PlanArray[i].MedName[j] = gostring[j]; j++;
+  } PlanArray[i].MedName[j] = '\0'; j = 0;
+  gostring = jsonBuffer["Remark"];
+  while(gostring[i]!='\0' and j < 30){
+    PlanArray[i].Remark[j] = gostring[j]; j++;
+  } PlanArray[i].Remark[j] = '\0'; j = 0; 
+  PlanArray[i].OnceMeasure = jsonBuffer["OnceMeasure"];
+  PlanArray[i].IntervalHour = jsonBuffer["IntervalHour"];
+  PlanArray[i].IF_BeforeEat = jsonBuffer["IF_BeforeEat"];
+  PlanArray[i].StartTimeNTP = jsonBuffer["StartTimeNTP"];
+  PlanArray[i].EndTimeNTP = jsonBuffer["EndTimeNTP"];
+  PlanArray[i].ledpin = i % 10;   //自动依次存放在相邻的LED格子下,重大不过9
+  PlanArray[i].state = 1;  //结构体赋值完毕设置状态为待机状态
+  return 0;
+}
+
+/* 按时间修改每个计划工作状态 */
+int DecidePlan(){   //检查修改每个计划的状态
+  for(int i = 0;i < SIZE_PLANARRAY;i++){
+    if(PlanArray[i].state == 0) continue;
+    if(PlanArray[i].EndTimeNTP < MCU_BootingTime + int(floor(millis()/1000))){
+      PlanArray[i].state = 0;continue; //过时的直接设置为无效状态
+    }
+    if(PlanArray[i].state == 1){   //当待机状态达到开始时间时判断具体的工作状态
+      if(PlanArray[i].StartTimeNTP > MCU_BootingTime + int(floor(millis()/1000)))continue;  //未到时间为待机状态
+      if(PlanArray[i].IntervalHour <= 8){
+        if(PlanArray[i].IF_BeforeEat){PlanArray[i].state = 2;continue;}
+        else{PlanArray[i].state = 3;continue;}
+      }else if(PlanArray[i].IntervalHour <= 12){
+        if(PlanArray[i].IF_BeforeEat){PlanArray[i].state = 4;continue;}
+        else{PlanArray[i].state = 5;continue;}
+      }else if(PlanArray[i].IntervalHour <= 24){
+        if(PlanArray[i].IF_BeforeEat){PlanArray[i].state = 6;continue;}
+        else{PlanArray[i].state = 7;continue;}
+      }else if(PlanArray[i].IntervalHour > 24){
+        if(PlanArray[i].IF_BeforeEat){PlanArray[i].state = 8;continue;}
+        else{PlanArray[i].state = 9;continue;}
+      }  //规定2和3为一天提醒三次、4和5为一天两次、6和7为一天一次、8和9为多天一次（偶为饭前）
+    }
+  }
+  return 0;
+}
+
+/* 输出目前符合状态的计划数据 */
+void PrintPlan(const int pstate){    //根据pstate(用药安排的时间)输出计划,并使得所在格子发光
+  DecidePlan();   //先检查是否有数据过期
+  if(pstate == 1){Serial.println("\n这是所有用药计划：");}
+  else{Serial.println("\n输出状态为 ");Serial.print(pstate);Serial.println(" 的所有用药计划：");}
+  Serial.print("DoctorName\t");Serial.print("MedName\t\t");Serial.print("OnceMeasure\t");Serial.print("IntervalHour\t");
+  Serial.print("IF_BeforeEat\t");Serial.print("StartTimeNTP\t");Serial.print("EndTimeNTP\t");Serial.print("Remark\t");Serial.println("ledpin");
+  for(int i = 0;i < SIZE_PLANARRAY;i++){
+    if((pstate == 1 and PlanArray[i].state)or(PlanArray[i].state == pstate)){
+      digitalWrite(LED[PlanArray[i].ledpin],HIGH);      //控制本格LED亮      
+      Serial.print(PlanArray[i].DoctorName);Serial.print("\t\t");
+      Serial.print(PlanArray[i].MedName);Serial.print("\t\t");
+      Serial.print(PlanArray[i].OnceMeasure);Serial.print("\t\t");
+      Serial.print(PlanArray[i].IntervalHour);Serial.print("\t\t");
+      Serial.print(PlanArray[i].IF_BeforeEat);Serial.print("\t\t");
+      Serial.print(PlanArray[i].StartTimeNTP);Serial.print("\t");
+      Serial.print(PlanArray[i].EndTimeNTP);Serial.print("\t");
+      Serial.print(PlanArray[i].Remark);Serial.print("\t\t");
+      Serial.print(PlanArray[i].ledpin);Serial.print("\t\t");
+      Serial.println(PlanArray[i].state);
+    }
+  }
+  return 0;
+}
+
+/* 控制LED灯组工作 */
+//ONLED_PIN控制单个编号灯亮、OFFLED_PIN控制单个编号灯暗、LightSwitch控制所有灯亮暗
+void INT_LEDCommand(int* ONLED_PIN,int* OFFLED_PIN,int* LightSwitch){  //当LightSwitch为1时控制全部灯流转亮暗、-1时全关、0时可以让单个控制的两变量工作
+  if(*LightSwitch == 1){  //开启所有灯亮
+    for(int i = 0;i < LED_Number;i++) digitalWrite(LED[i],LEDSwitch);
+    LEDSwitch = (LEDSwitch+1) % 2;     //流转开启所有灯变量
+    *LightSwitch = 0;*ONLED_PIN = 0;*OFFLED_PIN = 0;return 0;
+  }else if(*LightSwitch == -1){  //开启所有灯暗
+    for(int i = 0;i < LED_Number;i++) digitalWrite(LED[i],LOW);
+    *LightSwitch = 0;*ONLED_PIN = 0;*OFFLED_PIN = 0;return 0;
+  }
+  if(*ONLED_PIN == *OFFLED_PIN){*ONLED_PIN = 0;*OFFLED_PIN = 0;return 0;}
+  if(*ONLED_PIN != 0) digitalWrite(LED[*ONLED_PIN-1],HIGH);
+  if(*OFFLED_PIN != 0) digitalWrite(LED[*OFFLED_PIN-1],LOW);
+  *ONLED_PIN = 0;*OFFLED_PIN = 0;
+  return 0;
+}
+
+/* 向心知天气服务器申请天气字符串 */
+void ReqWeather(int* Phenomena,int* Temperature){
+  Serial3.println(AT_10);
+  if(espstring.indexOf("CONNECT") <= 0){
+    while(!Serial3.available()){}
+    espstring = Serial3.readString();
+    Serial.println(espstring);
+  }
+  Serial3.println(AT_11); Serial_Transfer();
+  Serial3.println(AT_12); Serial_Transfer();
+  Serial3.println(Api_Weather);
+  while(!Serial3.available()){}
+  espstring = Serial3.readString();
+  Serial.println(espstring);
+  espstring = Json_Extraction(espstring);
+  GETWeather(espstring,Phenomena,Temperature);
+  while(!Serial3.available()){
+    delay(300);
+    Serial3.print(Api_OFF);
+  }Serial3.println("AT");Serial_Transfer();
+  Serial3.println(AT_13); Serial_Transfer();
+  Serial3.println(AT_14); Serial_Transfer();
+  return 0;
+}
+
+/* 天气信息JSON提取所需变量函数 */
+void GETWeather(String Json,int* Phenomena,int* Temperature){
+  StaticJsonDocument<400> jsonBuffer;       //创建一个名为jsonBuffer的JSON变量
+  DeserializationError error = deserializeJson(jsonBuffer, Json);  //使用Json字符串构建JSON变量并赋值于jsonBuffer
+  if (error){     //构建错误就报错  
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+    return -1;
+  }
+  *Phenomena = jsonBuffer["results"][0]["now"]["code"];
+  *Temperature = jsonBuffer["results"][0]["now"]["temperature"];
+  Serial.print(*Phenomena);Serial.print(" ; ");
+  Serial.println(*Temperature);
+  return 0;
+}
+
+/* 控制音乐播放器函数 */
+int Voice(int* Voice_Number){     //使用Music_Number控制，并且已经设置新的软件串口(10,11)
+  softSerial1.listen();  while(!softSerial1.isListening()){}     //开启监视softSerial1及音乐播放器软串口
+  unsigned char Voice_Begin[4] = {0xAA,0x02,0x00,0xAC};       //使用unsigned char数组来存放播放指令
+  unsigned char Voice_Stop[4] = {0xAA,0x03,0x00,0xAD};
+  unsigned char Voice1[7] = {0xAA,0x16,0x03,0x01,0x00,0x01,0xC5};   //1-8为提醒音乐、9-24为回应语音（20-24为天气相关）、25-28为彩蛋、29-32为音乐
+  unsigned char Voice2[7] = {0xAA,0x16,0x03,0x01,0x00,0x02,0xC6};   //-1为开始、0为停止
+  unsigned char Voice3[7] = {0xAA,0x16,0x03,0x01,0x00,0x03,0xC7};
+  unsigned char Voice4[7] = {0xAA,0x16,0x03,0x01,0x00,0x04,0xC8};
+  unsigned char Voice5[7] = {0xAA,0x16,0x03,0x01,0x00,0x05,0xC9};
+  unsigned char Voice6[7] = {0xAA,0x16,0x03,0x01,0x00,0x06,0xCA};
+  unsigned char Voice7[7] = {0xAA,0x16,0x03,0x01,0x00,0x07,0xCB};
+  unsigned char Voice8[7] = {0xAA,0x16,0x03,0x01,0x00,0x08,0xCC};
+  unsigned char Voice9[7] = {0xAA,0x16,0x03,0x01,0x00,0x09,0xCD};
+  unsigned char Voice10[7] = {0xAA,0x16,0x03,0x01,0x00,0x0A,0xCE};
+  unsigned char Voice11[7] = {0xAA,0x16,0x03,0x01,0x00,0x0B,0xCF};
+  unsigned char Voice12[7] = {0xAA,0x16,0x03,0x01,0x00,0x0C,0xD0};
+  unsigned char Voice13[7] = {0xAA,0x16,0x03,0x01,0x00,0x0D,0xD1};
+  unsigned char Voice14[7] = {0xAA,0x16,0x03,0x01,0x00,0x0E,0xD2};
+  unsigned char Voice15[7] = {0xAA,0x16,0x03,0x01,0x00,0x0F,0xD3};
+  unsigned char Voice16[7] = {0xAA,0x16,0x03,0x01,0x00,0x10,0xD4};
+  unsigned char Voice17[7] = {0xAA,0x16,0x03,0x01,0x00,0x11,0xD5};
+  unsigned char Voice18[7] = {0xAA,0x16,0x03,0x01,0x00,0x12,0xD6};
+  unsigned char Voice19[7] = {0xAA,0x16,0x03,0x01,0x00,0x13,0xD7};
+  unsigned char Voice20[7] = {0xAA,0x16,0x03,0x01,0x00,0x14,0xD8};
+  unsigned char Voice21[7] = {0xAA,0x16,0x03,0x01,0x00,0x15,0xD9};
+  unsigned char Voice22[7] = {0xAA,0x16,0x03,0x01,0x00,0x16,0xDA};
+  unsigned char Voice23[7] = {0xAA,0x16,0x03,0x01,0x00,0x17,0xDB};
+  unsigned char Voice24[7] = {0xAA,0x16,0x03,0x01,0x00,0x18,0xDC};
+  unsigned char Voice25[7] = {0xAA,0x16,0x03,0x01,0x00,0x19,0xDD};
+  unsigned char Voice26[7] = {0xAA,0x16,0x03,0x01,0x00,0x1A,0xDE};
+  unsigned char Voice27[7] = {0xAA,0x16,0x03,0x01,0x00,0x1B,0xDF};
+  unsigned char Voice28[7] = {0xAA,0x16,0x03,0x01,0x00,0x1C,0xE0};
+  unsigned char Voice29[6] = {0xAA,0x07,0x02,0x00,0x1D,0xD0};
+  unsigned char Voice30[6] = {0xAA,0x07,0x02,0x00,0x1E,0xD1};
+  unsigned char Voice31[6] = {0xAA,0x07,0x02,0x00,0x1F,0xD2};
+  unsigned char Voice32[6] = {0xAA,0x07,0x02,0x00,0x20,0xD3};
+  unsigned char VoiceSound[5] = {0xAA,0x13,0x01,0x1E,0xDC};       //调整音量
+  softSerial1.write(VoiceSound,5);
+  if(*Voice_Number == 1){softSerial1.write(Voice29,6);softSerial1.write(Voice1,7);}
+  else if(*Voice_Number == 2){softSerial1.write(Voice29,6);softSerial1.write(Voice2,7);}
+  else if(*Voice_Number == 3){softSerial1.write(Voice29,6);softSerial1.write(Voice3,7);}
+  else if(*Voice_Number == 4){softSerial1.write(Voice29,6);softSerial1.write(Voice4,7);}
+  else if(*Voice_Number == 5){softSerial1.write(Voice29,6);softSerial1.write(Voice5,7);}
+  else if(*Voice_Number == 6){softSerial1.write(Voice29,6);softSerial1.write(Voice6,7);}
+  else if(*Voice_Number == 7){softSerial1.write(Voice29,6);softSerial1.write(Voice7,7);}
+  else if(*Voice_Number == 8){softSerial1.write(Voice8,7);}
+  else if(*Voice_Number == 9){softSerial1.write(Voice9,7);}
+  else if(*Voice_Number == 10){softSerial1.write(Voice10,7);}
+  else if(*Voice_Number == 11){softSerial1.write(Voice11,7);}
+  else if(*Voice_Number == 12){softSerial1.write(Voice12,7);}
+  else if(*Voice_Number == 13){softSerial1.write(Voice13,7);}
+  else if(*Voice_Number == 14){softSerial1.write(Voice14,7);}
+  else if(*Voice_Number == 15){softSerial1.write(Voice15,7);}
+  else if(*Voice_Number == 16){softSerial1.write(Voice16,7);}
+  else if(*Voice_Number == 17){softSerial1.write(Voice17,7);}
+  else if(*Voice_Number == 18){softSerial1.write(Voice18,7);}
+  else if(*Voice_Number == 19){softSerial1.write(Voice19,7);}
+  else if(*Voice_Number == 20){softSerial1.write(Voice20,7);}
+  else if(*Voice_Number == 21){softSerial1.write(Voice21,7);}
+  else if(*Voice_Number == 22){softSerial1.write(Voice22,7);}
+  else if(*Voice_Number == 23){softSerial1.write(Voice23,7);}
+  else if(*Voice_Number == 24){softSerial1.write(Voice24,7);}
+  else if(*Voice_Number == 25){softSerial1.write(Voice25,7);}
+  else if(*Voice_Number == 26){softSerial1.write(Voice26,7);}
+  else if(*Voice_Number == 27){softSerial1.write(Voice27,7);}
+  else if(*Voice_Number == 28){softSerial1.write(Voice28,7);}
+  else if(*Voice_Number == 29){softSerial1.write(Voice29,6);}
+  else if(*Voice_Number == 30){softSerial1.write(Voice30,6);}
+  else if(*Voice_Number == 31){softSerial1.write(Voice31,6);}
+  else if(*Voice_Number == 32){softSerial1.write(Voice32,6);}
+  else if(*Voice_Number == -1){softSerial1.write(Voice_Begin,4);}
+  else if(*Voice_Number == 0){softSerial1.write(Voice_Stop,4);}
+  *Voice_Number = 0; softSerial1.end();  return 0;   //关闭监视softSerial1及音乐播放器软串口
+}
+
+/* 读取计算现实时间与设定时间比较，决定是否提醒 */
+void NTPRemind(){             //到饭点或者自定义时间的前后半小时会开启提醒功能
+  long unsigned int NTPtime_new = (long(MCU_BootingTime + int(floor(millis()/1000)))%86400);
+  if(NTPtime == 0){           //饭前半小时
+    if(NTPtime_new<=(long((NTPtime_Breakfast-8-0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Breakfast-8-0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(2);PrintPlan(4);NTPtime = 1;Music_Number = 1;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Lunchtime-8-0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Lunchtime-8-0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(2);PrintPlan(6);PrintPlan(8);Music_Number = 3;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Dinner-8-0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Dinner-8-0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(2);PrintPlan(4);NTPtime = 1;Music_Number = 5;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Test-8-0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Test-8+0.5+24)*3600)%86400-10)){
+      Serial.print("自定义时间饭前半小时提醒，现在时间为：\t");Serial.println(NTPtime_new);PrintPlan(1);NTPtime = 1;Music_Number = 7;Voice(&Music_Number);
+    }
+  }else if(NTPtime == 1){     //饭后半小时
+    if(NTPtime_new<=(long((NTPtime_Breakfast-8+0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Breakfast-8+0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(3);PrintPlan(5);NTPtime = 0;Music_Number = 2;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Lunchtime-8+0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Lunchtime-8+0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(3);PrintPlan(5);PrintPlan(9);NTPtime = 0;Music_Number = 4;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Dinner-8+0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Dinner-8+0.5+24)*3600)%86400-10)){
+      Serial.println(NTPtime_new);PrintPlan(3);PrintPlan(5);NTPtime = 0;Music_Number = 6;Voice(&Music_Number);
+    }else if(NTPtime_new<=(long((NTPtime_Test-8+0.5+24)*3600)%86400+10) and NTPtime_new>=(long((NTPtime_Test-8+0.5+24)*3600)%86400-10)){
+      Serial.print("自定义时间饭后半小时提醒，现在时间为：\t");Serial.println(NTPtime_new);PrintPlan(1);NTPtime = 0;Music_Number = 7;Voice(&Music_Number);
+    }
+  }
+  return 0;
+}
+
+/* AT反馈字符串提取JSON字符串函数 */
+String Json_Extraction(String Json_Str){     //从Json_Str里提取出Json字符串再return回去赋值，如果错误则出"ERRER"
+  int Json_Left = 0; int Json_Right = 0; int Json_Bracket = 1;            //定义Json字符串的左边界、右边界、括号数量变量
+  while(Json_Left < Json_Str.length() - 1 and Json_Str[Json_Left] != '{'){Json_Left +=1;}   //历遍Json_Str直到第一个'{'后将位置赋值给Json_Left
+  if(Json_Left >= Json_Str.length() - 1){return "ERRER";}
+  else{
+    for(Json_Right = Json_Left + 1;Json_Right < Json_Str.length();Json_Right++){  //从Json_Left+1开始历遍Json_Str，到Json_Bracket（括号数量）为0时停止，位置赋值给Json_Right
+      if(Json_Str[Json_Right] == '{'){Json_Bracket += 1;}
+      else if(Json_Str[Json_Right] == '}'){Json_Bracket -= 1;}
+      if(Json_Bracket == 0){break;}
+    }
+    if(Json_Right < Json_Str.length()){
+      return Json_Str.substring(Json_Left,Json_Right+1);   //.substring(Json_Left,Json_Right+1)提取出可能的JSON字符串并return出
+    }
+  }
+  return "ERRER";
+}
+
+/* —————————————————— 初始化函数定义 —————————————————— */
+
+/* LED数组及灯引脚初始化 */
+void InitLED(){
+  for(int i = 0;i < LED_Number;i++){
+    LED[i] = 44 + i;     //小灯泡引脚设置(从44到53号引脚)
+    pinMode(LED[i],OUTPUT);  //设置为输出脚
+  }
+  return 0;
+}
+
+/* —————— WIFI连接初始化函数定义 —————— */
+
+/* 函数AT结果反馈Serial */
+void Serial_Transfer(){   //主要用于测试连接结果 简单粗暴！
+  char s_A;
+  while(!Serial3.available()){}   //神技！可以保证信息传输到位
+  while(Serial3.available() > 0){
+    s_A = char(Serial3.read()); delay(2);      //延时很关键，串口读取可能过快
+    Serial.print(s_A);
+  }
+  return 0;
+}
+
+/* LOT服务器连接代码 */
+//设置为按钮模组的'A'连接物联网、'B'跳过连接物联网和电脑端'yes'、'no'
+int Aliyun_Connect(){       // 返回数：yes为0，no为-1
+  String s_AT = "";         // s_AT只用于判断是否连接LOT服务器
+  Serial.print("是否开始连接LOT服务器:(yes/no):\t\t");
+  while(s_AT != "yes"){     //输入(yes/no)判断是否连接服务器,yes只需要保证前三个为yes即可,注意需要/r/n及串口监视器的NL AND CL模式
+    if(Serial.available() > 0){
+      s_AT += char(Serial.read());
+      delay(2);      //很关键，串口读取可能过快
+    }else{
+      if(s_AT == "no\r\n"){
+        Serial.println("no\n不连接服务器 将启用部分功能 请尽快连接服务器\n");return -1;
+      }s_AT = "";
+      char key = myKeypad.getKey();
+      if(key){
+        if(key == 'A') break;
+        if(key == 'B'){LCD_Aliyun(3);Serial.println("no\n不连接服务器 将启用部分功能 请尽快连接服务器\n");return -1;}  //显示屏显示未连接
+      }
+    }
+    LCD_Aliyun(1);   //显示屏显示是否连接物联网
+  }
+  LCD_Aliyun(2);   //显示屏显示正在连接中
+  Serial.println("yes\n开始连接LOT服务器 请稍等！\n");
+  Serial3.println(AT_3); Serial_Transfer();
+  Serial3.println(AT_4); Serial_Transfer();
+  Serial3.println(AT_5); Serial_Transfer(); Serial_Transfer(); Serial_Transfer();  //连接WIFI时，它有三次不同的回答，注意来三次应对
+  Serial3.println(AT_6); Serial_Transfer();
+  Serial3.println(AT_7); Serial_Transfer();
+  Serial3.println(AT_8); Serial_Transfer(); Serial_Transfer();  //第一次发“+MQTT.....1” 第二次才是OK，这不同步
+  Serial.println("\nLOT服务器连接完成！\n");
+  while(Serial3.read() >= 0){}   //最后清理干净各串口
+  while(Serial.read() >= 0){} 
+  return 0;
+}
+
+/* 显示屏是否显示连接阿里云 */
+void LCD_Aliyun(const int i){
+  u8g2.setFont(u8g2_font_unifont_t_chinese1);     //设置显示屏字体
+  if(i == 1){
+    u8g2.firstPage();
+    do{
+      u8g2.setCursor(0, 15);
+      u8g2.print("是否连接物联网?");
+      u8g2.setCursor(0, 60);
+      u8g2.print("A-开   B-关");   
+    }while(u8g2.nextPage());
+  }else if(i == 2){
+    u8g2.firstPage();
+    do{
+      u8g2.setCursor(0, 30);
+      u8g2.print("正在连接中，请稍后");
+    }while(u8g2.nextPage());
+  }else if(i == 3){
+    u8g2.firstPage();
+    do{
+      u8g2.setCursor(0, 15);
+      u8g2.print("未连接");
+      u8g2.setCursor(0, 30);
+      u8g2.print("将导致部分功能缺失");
+      u8g2.setCursor(0, 45);
+      u8g2.print("请及时连接");
+    }while(u8g2.nextPage());
+  }
+  return 0;
+}
+
+/* NTP读取时间戳 */
+void LOT_NTPTimeGet(long unsigned int* NTPTime){       //通过读取LOT上的NTP时间戳来获取准确时间
+  String str_time; *NTPTime = 0; char* item = NULL;
+  long unsigned int MCUTime = floor(millis()/1000);    //读取设备运行时间，保持与NTP时间上的一致，向下取整(ms)
+  Serial3.println(AT_NTPTime);                         //向NTP主题发送申请AT指令
+  while(!Serial3.available()){} 
+  if(Serial3.available()){
+    str_time = Serial3.readString();  Serial.println(str_time);    //查看反馈结果
+    item = strstr(str_time.c_str(),"serverSendTime");              //使用strstr函数寻找所需时间在字符串里的位置，item为字符指针
+    for(int i = 17; i <= 26;i++)  *NTPTime = (item[i] - '0') + (*NTPTime)*10;  //只需要前10位数组，时间戳单位为s，向下取整
+    *NTPTime -= MCUTime;     //注意当前时间要减去设备已运行时间
+    Serial.println(*NTPTime);
+  }
+  return 0;
+}
